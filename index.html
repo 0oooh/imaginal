@@ -35,22 +35,22 @@
     border: 1px solid rgba(var(--ink), .22); transition: border-color .2s;
   }
   #bar:focus-within { border-color: rgba(var(--ink), .5); }
-  /* 크기는 한 줄로 고정. 줄을 바꾸면 상자 안에서 커서가 있는 줄로 넘어간다 */
+  /* 크기는 한 줄로 고정. 줄 높이 = 상자 높이라 줄을 바꾸면 커서가 있는 줄 하나만 보인다 */
   #type {
-    width: 100%; display: block; box-sizing: border-box; height: 38px;
-    padding: 11px 12px; border: 0; border-radius: 0; outline: 0; resize: none; overflow: hidden;
-    background: none; color: inherit; font: inherit; font-size: 13px; line-height: 16px; letter-spacing: .04em;
+    width: 100%; display: block; box-sizing: border-box; height: 30px;
+    padding: 0 12px; border: 0; border-radius: 0; outline: 0; resize: none; overflow: hidden;
+    background: none; color: inherit; font: inherit; font-size: 13px; line-height: 30px; letter-spacing: .04em;
     caret-color: rgb(var(--red));
   }
   /* 입력창을 아직 안 눌렀을 때(모바일 등)도 빨간 커서가 깜빡여서 칠 수 있는 곳임을 알린다 */
   #caret {
-    position: absolute; left: 12px; top: 11px; width: 1px; height: 16px; display: none;
+    position: absolute; left: 12px; top: 7px; width: 1px; height: 16px; display: none;
     background: rgb(var(--red)); animation: blink 1.06s steps(1) infinite; pointer-events: none;
   }
   #bar.idle #caret { display: block; }
   @keyframes blink { 50% { opacity: 0; } }
   #live {
-    display: flex; align-items: center; gap: 6px; height: 40px; padding: 0 12px; box-sizing: border-box;
+    display: flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px; box-sizing: border-box;
     border: 1px solid rgba(var(--ink), .22); background: none; cursor: pointer; opacity: .45;
     transition: opacity .2s;
   }
@@ -66,7 +66,7 @@
 <button id="theme" class="ui" type="button" data-theme="dark" aria-label="theme">dark</button>
 <div id="dock">
   <div id="bar" class="ui" data-theme="dark">
-    <textarea id="type" rows="1" enterkeyhint="enter"
+    <textarea id="type" rows="1" wrap="off" enterkeyhint="enter"
       autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="text"></textarea>
     <span id="caret"></span>
   </div>
@@ -752,6 +752,14 @@ input.addEventListener('compositionend', () => {
   if (enterAfterCompose) { enterAfterCompose = false; commit(); }
 });
 input.addEventListener('input', sync);
+// 상자에 커서가 있는 줄 하나만 딱 보이게 줄 단위로 스크롤한다 (줄 높이 = 상자 높이, 긴 줄은 꺾지 않고 옆으로 흐른다)
+function snapLine() {
+  requestAnimationFrame(() => {
+    input.scrollTop = (input.value.slice(0, input.selectionStart).split('\n').length - 1) * input.clientHeight;
+  });
+}
+input.addEventListener('input', snapLine);
+document.addEventListener('selectionchange', () => { if (document.activeElement === input) snapLine(); });
 for (const [el, ev] of [[input, 'focus'], [input, 'blur'], [window, 'focus'], [window, 'blur']]) el.addEventListener(ev, idle);
 // 엔터: live에서는 다음 줄. 아니면 바꾸기이고 Shift+Enter가 다음 줄
 input.addEventListener('keydown', e => {
@@ -795,14 +803,17 @@ function fitViewport() {
   app.style.transform = follow ? `translate(${vv.offsetLeft}px, ${vv.offsetTop}px)` : '';
   app.classList.toggle('kb', !!follow);   // 키보드 위에서는 홈 표시줄 여백 없이 바로 붙인다
   if (!follow && (scrollX || scrollY)) scrollTo(0, 0);
+}
+// 캔버스 크기가 바뀌면(키보드, 회전 등) 그리기 전에 바로 픽셀을 다시 맞춘다. 그림이 늘어나거나 찌그러지지 않게
+new ResizeObserver(() => {
   const dpr = window.devicePixelRatio || 1;
   if (Math.round(canvas.clientWidth * dpr) !== W || Math.round(canvas.clientHeight * dpr) !== H) layout();
-}
+}).observe(canvas);
 window.visualViewport?.addEventListener('resize', fitViewport);
 window.visualViewport?.addEventListener('scroll', fitViewport);
 addEventListener('resize', fitViewport);
-input.addEventListener('focus', fitViewport);
-// 키보드가 내려가는 동안 값이 늦게 바뀌어서, 조금 뒤에 한 번 더 맞춘다
+// 키보드가 올라오는 동안 값이 늦게 바뀌어서, 조금 뒤에 한 번 더 맞춘다
+input.addEventListener('focus', () => { fitViewport(); setTimeout(fitViewport, 350); });
 input.addEventListener('blur', () => { fitViewport(); setTimeout(fitViewport, 350); });
 // 페이지는 스크롤되지 않는다. 스크롤하면 주소창이 접혔다 펴지며 보이는 영역이 계속 바뀌어서 막는다 (입력창 안은 그대로)
 document.addEventListener('touchmove', e => { if (e.target !== input) e.preventDefault(); }, { passive: false });
