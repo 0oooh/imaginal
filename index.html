@@ -7,7 +7,9 @@
 <title>imaginal</title>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
-  canvas { display: block; width: 100vw; height: 100vh; }
+  /* 화면 전체를 지금 보이는 영역에 붙인다. 모바일 키보드가 올라오면 이 상자가 키보드 위 영역으로 줄어든다 */
+  #app { position: fixed; left: 0; top: 0; width: 100%; height: 100%; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
   /* UI는 테마 전환 물결이 지나가는 순간 따로 뒤집힌다 */
   [data-theme=dark] { --ink: 255, 255, 255; --bg: 0, 0, 0; --red: 172, 50, 50; }
   [data-theme=light] { --ink: 0, 0, 0; --bg: 255, 255, 255; --red: 224, 28, 28; }
@@ -16,16 +18,17 @@
     color: rgb(var(--ink)); -webkit-tap-highlight-color: transparent;
   }
   #theme {
-    position: fixed; top: calc(20px + env(safe-area-inset-top)); right: 20px; padding: 7px 10px;
+    position: absolute; top: calc(20px + env(safe-area-inset-top)); right: 20px; padding: 7px 10px;
     border: 1px solid rgba(var(--ink), .5); background: none; cursor: pointer;
     transition: background-color .15s, color .15s;
   }
   @media (hover: hover) { #theme:hover { background: rgb(var(--ink)); color: rgb(var(--bg)); } }
   /* 하단: 입력창과 그 옆에 떨어진 live 박스 */
   #dock {
-    position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom)); transform: translateX(-50%);
+    position: absolute; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom)); transform: translateX(-50%);
     display: flex; align-items: flex-end; gap: 8px;
   }
+  #app.kb #dock { bottom: 12px; }
   #bar {
     position: relative; width: min(320px, calc(100vw - 112px)); box-sizing: border-box;
     border: 1px solid rgba(var(--ink), .22); transition: border-color .2s;
@@ -57,6 +60,7 @@
 </style>
 </head>
 <body>
+<div id="app">
 <canvas id="c"></canvas>
 <button id="theme" class="ui" type="button" data-theme="dark" aria-label="theme">dark</button>
 <div id="dock">
@@ -66,6 +70,7 @@
     <span id="caret"></span>
   </div>
   <button id="live" class="ui on" type="button" data-theme="dark" aria-pressed="true"><i></i>live</button>
+</div>
 </div>
 <script>
 'use strict';
@@ -542,11 +547,11 @@ function sweepGrid(A) {
   for (const a of cells) a.flip = flipAt(a.d, a.c, a.r);
   const pxFlip = new Map(px.map(p => [p, flipAt(dist(p.tx, p.ty), Math.round(p.tx - A.ox), Math.round(p.ty - A.oy))]));
   // UI는 자기 가운데 칸에 물결이 닿을 때 뒤집힌다
-  const dpr = W / innerWidth;
+  const box = canvas.getBoundingClientRect(), dpr = W / box.width;
   const uiFlip = new Map(uiEls.map(el => {
     const b = el.getBoundingClientRect();
-    const c = Math.floor(((b.left + b.width / 2) * dpr - W / 2) / unit - A.ox);
-    const r = Math.floor(((b.top + b.height / 2) * dpr - H / 2) / unit - A.oy);
+    const c = Math.floor(((b.left - box.left + b.width / 2) * dpr - W / 2) / unit - A.ox);
+    const r = Math.floor(((b.top - box.top + b.height / 2) * dpr - H / 2) / unit - A.oy);
     return [el, flipAt(dist(c + A.ox, r + A.oy), c, r)];
   }));
   A.gridKey = gk;
@@ -667,8 +672,8 @@ function render(now) {
 
 function layout() {
   const dpr = window.devicePixelRatio || 1;
-  W = canvas.width = Math.round(innerWidth * dpr);
-  H = canvas.height = Math.round(innerHeight * dpr);
+  W = canvas.width = Math.round(canvas.clientWidth * dpr);
+  H = canvas.height = Math.round(canvas.clientHeight * dpr);
   const { w, h } = targets(text, theme);
   unit = fitUnit(w, h);
   // 창 크기가 바뀌면 움직이던 픽셀도 제자리로 보낸다
@@ -783,17 +788,24 @@ themeBtn.addEventListener('click', () => {
   start();
 });
 
-// iOS는 키보드가 화면을 줄이지 않고 덮는다. 보이는 영역 바닥에 입력창을 붙인다
-if (window.visualViewport) {
-  const vv = window.visualViewport;
-  const lift = () => {
-    dock.style.transform = `translateX(-50%) translateY(${-Math.max(0, innerHeight - vv.height - vv.offsetTop)}px)`;
-  };
-  vv.addEventListener('resize', lift);
-  vv.addEventListener('scroll', lift);
+// iOS는 키보드가 화면을 줄이지 않고 덮은 뒤, 입력창이 보이게 페이지를 밀어 올린다.
+// 그래서 화면 전체(#app)를 그때그때 보이는 영역(visualViewport)에 맞춰 놓는다: 로고는 키보드 위 가운데, 입력창은 키보드 바로 위.
+// 손가락으로 확대한 동안은 따라가지 않는다
+const app = document.getElementById('app');
+function fitViewport() {
+  const vv = window.visualViewport, follow = vv && vv.scale < 1.01;
+  app.style.height = follow ? `${vv.height}px` : '';
+  app.style.transform = follow ? `translate(${vv.offsetLeft}px, ${vv.offsetTop}px)` : '';
+  // 키보드가 올라와 있으면 홈 표시줄 여백 없이 키보드 바로 위에 붙인다
+  app.classList.toggle('kb', !!follow && vv.height < document.documentElement.clientHeight - 80);
+  const dpr = window.devicePixelRatio || 1;
+  if (Math.round(canvas.clientWidth * dpr) !== W || Math.round(canvas.clientHeight * dpr) !== H) layout();
 }
-addEventListener('resize', layout);
+window.visualViewport?.addEventListener('resize', fitViewport);
+window.visualViewport?.addEventListener('scroll', fitViewport);
+addEventListener('resize', fitViewport);
 
+fitViewport();
 layout();
 if (matchMedia('(pointer: fine)').matches) input.focus();   // 데스크톱은 바로 칠 수 있게. 모바일은 눌러야 키보드가 뜬다
 idle();
