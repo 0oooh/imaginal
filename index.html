@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<!-- maximum-scale: iOS가 입력창을 누를 때 화면을 확대하지 않게 (손가락 확대는 그대로 됨) -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, interactive-widget=resizes-content">
+<title>imaginal</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  /* UI는 테마 전환 물결이 지나가는 순간 따로 뒤집힌다 */
+  [data-theme=dark] { --ink: 255, 255, 255; --bg: 0, 0, 0; --red: 172, 50, 50; }
+  [data-theme=light] { --ink: 0, 0, 0; --bg: 255, 255, 255; --red: 224, 28, 28; }
+  .ui {
+    font: 11px/1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: .06em;
+    color: rgb(var(--ink)); -webkit-tap-highlight-color: transparent;
+  }
+  #theme {
+    position: fixed; top: calc(20px + env(safe-area-inset-top)); right: 20px; padding: 7px 10px;
+    border: 1px solid rgba(var(--ink), .5); background: none; cursor: pointer;
+    transition: background-color .15s, color .15s;
+  }
+  @media (hover: hover) { #theme:hover { background: rgb(var(--ink)); color: rgb(var(--bg)); } }
+  /* 하단: 입력창과 그 옆에 떨어진 live 박스 */
+  #dock {
+    position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom)); transform: translateX(-50%);
+    display: flex; align-items: flex-end; gap: 8px;
+  }
+  #bar {
+    position: relative; width: min(320px, calc(100vw - 112px)); box-sizing: border-box;
+    border: 1px solid rgba(var(--ink), .22); transition: border-color .2s;
+  }
+  #bar:focus-within { border-color: rgba(var(--ink), .5); }
+  /* 평소엔 한 줄. 줄이 늘면 위로 커지고 6줄부터는 안에서 스크롤 */
+  #type {
+    width: 100%; display: block; box-sizing: border-box; height: 38px; max-height: 118px;
+    padding: 11px 12px; border: 0; border-radius: 0; outline: 0; resize: none; overflow-y: auto;
+    background: none; color: inherit; font: inherit; font-size: 13px; line-height: 16px; letter-spacing: .04em;
+    caret-color: rgb(var(--red));
+  }
+  /* 입력창을 아직 안 눌렀을 때(모바일 등)도 빨간 커서가 깜빡여서 칠 수 있는 곳임을 알린다 */
+  #caret {
+    position: absolute; left: 12px; top: 11px; width: 1px; height: 16px; display: none;
+    background: rgb(var(--red)); animation: blink 1.06s steps(1) infinite; pointer-events: none;
+  }
+  #bar.idle #caret { display: block; }
+  @keyframes blink { 50% { opacity: 0; } }
+  #live {
+    display: flex; align-items: center; gap: 6px; height: 40px; padding: 0 12px; box-sizing: border-box;
+    border: 1px solid rgba(var(--ink), .22); background: none; cursor: pointer; opacity: .45;
+    transition: opacity .2s;
+  }
+  #live.on { opacity: 1; }
+  @media (hover: hover) { #live:hover { opacity: 1; } }
+  #live i { width: 6px; height: 6px; box-sizing: border-box; border: 1px solid currentColor; }
+  #live.on i { background: rgb(var(--red)); border-color: rgb(var(--red)); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<button id="theme" class="ui" type="button" data-theme="dark" aria-label="theme">dark</button>
+<div id="dock">
+  <div id="bar" class="ui" data-theme="dark">
+    <textarea id="type" rows="1" enterkeyhint="enter"
+      autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="text"></textarea>
+    <span id="caret"></span>
+  </div>
+  <button id="live" class="ui on" type="button" data-theme="dark" aria-pressed="true"><i></i>live</button>
+</div>
+<script>
+'use strict';
+
+// index.html과 같은 로고 비트맵. # = 글자, R = 느낌표 점
+// (포인트 색은 아래 pointKinds 규칙으로 정하는데, 로고에서는 원래대로 첫 i의 점 = 전구, 느낌표 점 = 빨강이 된다)
+const BITMAP = [
+  '#.............#.........#',
+  '..#.#..##..##...###..##.#',
+  '#..#..#.#.#.#.#.#.#.#.#..',
+  '#.#.#.###.#.#.#.#.#.###.R',
+  '............#............',
+  '..........##.............',
+];
+const COLS = 25, ROWS = 6;
+
+// index.html의 라이트·다크 화면 색. 전구(노랑)는 다크에만 있다
+const LAMP_OFF = [70, 67, 60], LAMP_ON = [251, 242, 54];
+const THEME = {
+  light: { bg: [255, 255, 255], ink: [0, 0, 0], red: [224, 28, 28] },
+  dark: { bg: [0, 0, 0], ink: [255, 255, 255], red: [172, 50, 50], lamp: LAMP_ON },
+};
+const colorOf = (th, kind) => THEME[th][kind] || THEME[th].ink;
+const RANK = { ink: 0, lamp: 1, red: 2 };   // 그리는 순서. 색 있는 픽셀을 위에
+
+// 로고와 같은 문법의 글꼴. 0행 = 어센더, 1~3행 = 소문자 높이, 4~5행 = 디센더, 글자 사이 1칸
+// a, g, i, m, n, ! 는 로고에서 그대로 가져왔다 (로고의 m이 x 모양이라 x도 같은 모양).
+// l은 로고 끝 글자처럼 느낌표 모양이라 imaginal을 치면 로고 그대로가 된다
+const FONT = {
+  a: '.../.##/#.#/###',
+  b: '#../##./#.#/###',
+  c: '.../.##/#../.##',
+  d: '..#/.##/#.#/###',
+  e: '.../.##/###/##.',
+  f: '.##/###/.#./.#.',
+  g: '.../.##/#.#/#.#/..#/##.',
+  h: '#../###/#.#/#.#',
+  i: '#/./#/#',
+  j: '.#/../.#/.#/.#/#.',
+  k: '#../#.#/##./#.#',
+  l: '#/#/./#',
+  m: '.../#.#/.#./#.#',
+  n: '.../###/#.#/#.#',
+  o: '.../###/#.#/###',
+  p: '.../###/#.#/###/#../#..',
+  q: '.../###/#.#/###/..#/..#',
+  r: '.../.##/#../#..',
+  s: '.../.##/.#./##.',
+  t: '.#./###/.#./.##',
+  u: '.../#.#/#.#/###',
+  v: '.../#.#/#.#/.#.',
+  w: '...../#...#/#.#.#/.#.#.',
+  x: '.../#.#/.#./#.#',
+  y: '.../#.#/#.#/###/..#/##.',
+  z: '.../##./.#./.##',
+  0: '###/#.#/#.#/###',
+  1: '.#/##/.#/.#',
+  2: '##./..#/.#./###',
+  3: '###/.##/..#/###',
+  4: '#.#/#.#/###/..#',
+  5: '###/##./..#/##.',
+  6: '#../###/#.#/###',
+  7: '###/..#/.#./.#.',
+  8: '###/.#./#.#/###',
+  9: '###/#.#/###/..#',
+  '!': '#/#/./#',
+  '?': '##./..#/.../.#.',
+  '.': './././#',
+  ',': './././#/#',
+  "'": '#/#',
+  '-': '../../##',
+  ':': './#/./#',
+  '(': '.#/#./#./.#',
+  ')': '#./.#/.#/#.',
+  '/': '.#/.#/#./#.',
+};
+const GAP = 1, SPACE = 2, LINE = 7, MAX_COLS = 90, MAX_LEN = 80;
+
+// 점 = 주변 8칸이 모두 빈 픽셀 (i·j·!·?의 점, 마침표 같은 것)
+const markDots = (cells, x, y) => {
+  for (const a of cells) a.dot = !cells.some(b => b !== a && Math.abs(x(b) - x(a)) <= 1 && Math.abs(y(b) - y(a)) <= 1);
+};
+
+const GLYPHS = { ' ': { w: SPACE, cells: [] } };
+for (const [ch, src] of Object.entries(FONT)) {
+  const rows = src.split('/'), cells = [];
+  rows.forEach((row, r) => [...row].forEach((v, c) => { if (v === '#') cells.push({ c, r }); }));
+  markDots(cells, a => a.c, a => a.r);
+  GLYPHS[ch] = { w: rows[0].length, cells };
+}
+
+// 로고 칸. 좌표는 화면 가운데를 0으로 한 칸 단위 (index.html처럼 로고의 (12.5, 2.5)가 가운데)
+const LOGO = [];
+BITMAP.forEach((row, r) => [...row].forEach((ch, c) => {
+  if (ch !== '.') LOGO.push({ x: c - COLS / 2, y: r - 2.5, r, g: 0 });
+}));
+markDots(LOGO, a => a.x, a => a.y);
+
+const lineWidth = s => s ? [...s].reduce((w, ch) => w + GLYPHS[ch].w, 0) + GAP * (s.length - 1) : 0;
+
+function wrap(str) {
+  const lines = [];
+  for (const para of str.split('\n')) {
+    let line = '';
+    for (const word of para.split(/(?<= )/)) {
+      if (line && lineWidth(line + word.trimEnd()) > MAX_COLS) { lines.push(line.trimEnd()); line = ''; }
+      line += word;
+    }
+    lines.push(line);
+  }
+  return lines;
+}
+
+// 줄마다 포인트 색 픽셀을 둔다. 로고처럼 빨강은 아래 점(l·!·?·마침표), 전구(다크만)는 위 점(i·j).
+// 빨강 = 그 줄의 마지막 아래 점, 전구 = 첫 위 점 (그래서 i로 시작해 l로 끝나면 로고처럼 양 끝 점이 된다).
+// 그 종류가 없으면 다른 점을 쓰고(빨강은 마지막, 전구는 첫 점),
+// 점이 모자라면 빨강은 마지막 글자의 오른쪽 아래(기준선 위), 전구는 첫 글자의 맨 위 픽셀
+function pointKinds(cells, th, line = '') {
+  for (const a of cells) a.kind = 'ink';
+  if (!cells.length) return;
+  // i로 시작해 l로 끝나거나 l로 시작해 i로 끝나면 로고처럼 양 끝 점에 둔다 (i의 점 = 전구, l·!의 점 = 빨강)
+  const first = Math.min(...cells.map(a => a.g)), end = Math.max(...cells.map(a => a.g));
+  const pointOf = ch => ch === 'i' ? 'lamp' : ch === 'l' || ch === '!' ? 'red' : null;
+  const k0 = pointOf(line[first]), k1 = pointOf(line[end]);
+  if (k0 && k1 && k0 !== k1) {
+    const dotOf = g => cells.find(a => a.g === g && a.dot);
+    const ends = { [k0]: dotOf(first), [k1]: dotOf(end) };
+    ends.red.kind = 'red';
+    if (th === 'dark') ends.lamp.kind = 'lamp';
+    return;
+  }
+  const occ = new Set(cells.map(a => `${a.x},${a.y}`));
+  const dots = cells.filter(a => a.dot).sort((a, b) => a.x - b.x || a.y - b.y);
+  const isTop = a => occ.has(`${a.x},${a.y + 2}`);   // 한 칸 띄고 아래에 기둥이 있으면 위 점
+  const last = Math.max(...cells.map(a => a.g));
+  const red = dots.filter(a => !isTop(a)).pop() || dots[dots.length - 1]
+    || cells.filter(a => a.g === last).sort((a, b) => (a.r <= 3) - (b.r <= 3) || a.y - b.y || a.x - b.x).pop();
+  red.kind = 'red';
+  if (th !== 'dark') return;
+  const lamp = dots.find(a => isTop(a) && a !== red) || dots.find(a => a !== red)
+    || cells.filter(a => a !== red).sort((a, b) => a.g - b.g || a.y - b.y || a.x - b.x)[0];
+  if (lamp) lamp.kind = 'lamp';
+}
+
+// 쓴 글자가 차지할 칸들과 그 색. 그릴 칸이 하나도 없으면 로고로 돌아간다
+function targets(str, th) {
+  const lines = wrap(str), widths = lines.map(lineWidth), maxW = Math.max(...widths), out = [];
+  lines.forEach((line, k) => {
+    // 모든 줄을 같은 칸 격자에 둔다 (가장 긴 줄이 정가운데). 테마 전환 때 바탕 칸과 어긋나지 않게
+    let x = -maxW / 2 + Math.round((maxW - widths[k]) / 2);
+    const dy = (k - (lines.length - 1) / 2) * LINE - 2.5, cells = [];
+    [...line].forEach((ch, g) => {
+      for (const { c, r, dot } of GLYPHS[ch].cells) cells.push({ x: x + c, y: r + dy, r, dot, g });
+      x += GLYPHS[ch].w + GAP;
+    });
+    pointKinds(cells, th, line);
+    out.push(...cells);
+  });
+  if (out.length) return { cells: out, w: maxW, h: lines.length * LINE - 1 };
+  const logo = LOGO.map(a => ({ ...a }));
+  pointKinds(logo, th);
+  return { cells: logo, w: COLS, h: ROWS };
+}
+
+// 정방 비용 행렬의 최소 비용 배정 (헝가리안). 행 i에 배정된 열을 돌려준다
+function hungarian(cost, n) {
+  const u = new Float64Array(n + 1), v = new Float64Array(n + 1), minv = new Float64Array(n + 1);
+  const p = new Int32Array(n + 1), way = new Int32Array(n + 1), used = new Uint8Array(n + 1);
+  for (let i = 1; i <= n; i++) {
+    p[0] = i;
+    let j0 = 0;
+    minv.fill(Infinity); used.fill(0);
+    do {
+      used[j0] = 1;
+      const i0 = p[j0], row = (i0 - 1) * n;
+      let delta = Infinity, j1 = 0;
+      for (let j = 1; j <= n; j++) {
+        if (used[j]) continue;
+        const cur = cost[row + j - 1] - u[i0] - v[j];
+        if (cur < minv[j]) { minv[j] = cur; way[j] = j0; }
+        if (minv[j] < delta) { delta = minv[j]; j1 = j; }
+      }
+      for (let j = 0; j <= n; j++) {
+        if (used[j]) { u[p[j]] += delta; v[j] -= delta; } else minv[j] -= delta;
+      }
+      j0 = j1;
+    } while (p[j0] !== 0);
+    do { const j1 = way[j0]; p[j0] = p[j1]; j0 = j1; } while (j0);
+  }
+  const col = new Int32Array(n);
+  for (let j = 1; j <= n; j++) col[p[j] - 1] = j - 1;
+  return col;
+}
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: false });
+const input = document.getElementById('type');
+const liveBtn = document.getElementById('live');
+const themeBtn = document.getElementById('theme');
+const bar = document.getElementById('bar');
+const dock = document.getElementById('dock');
+const uiEls = [themeBtn, bar, liveBtn];
+// UI 하나의 테마. 테마 박스는 글자도 지금 테마 이름으로
+const setUi = (el, th) => {
+  el.dataset.theme = th;
+  if (el === themeBtn) el.textContent = th;
+};
+
+const clamp01 = x => x < 0 ? 0 : x > 1 ? 1 : x;
+const inOutCubic = x => x < 0.5 ? 4 * x * x * x : 1 - (-2 * x + 2) ** 3 / 2;
+// 바로 바뀜: 임계 감쇠 스프링으로 따라간다. 키를 연달아 쳐도 지금 속도를 이어받아 급출발하지 않는다 (약 0.45초면 닿음)
+// 엔터로 바뀜: 한 번에 천천히 출발해 천천히 멎는다
+const OMEGA = 14;
+const ENTER = { dur: 1300, ease: inOutCubic };
+
+let W, H, unit, text = '', live = true, theme = 'dark', running = false;
+let anim = null, pendingTheme = null, pendingText = false;   // 테마 전환 중에 바뀐 글자는 전환이 끝나고 반영
+let px = targets('', theme).cells.map(t => ({ tx: t.x, ty: t.y, kind: t.kind, m: null }));
+
+function fitUnit(w, h) {
+  const base = Math.max(4, Math.floor(Math.min(W * 0.6 / COLS, H * 0.4 / ROWS)));   // index.html의 로고 크기
+  return Math.max(2, Math.floor(Math.min(base, W * 0.9 / w, H * 0.8 / h)));
+}
+
+// ㄱ자 경로. 첫 구간(d1 방향, 길이 l1)을 가서 (cx, cy)에서 꺾어 둘째 구간(d2 방향)으로 간다.
+// 경로 밖(처음보다 뒤, 끝보다 앞)은 첫·끝 구간을 그대로 늘인 선이라 거기서도 가로나 세로로만 움직인다
+function lPath(x0, y0, x1, y1, verticalFirst) {
+  const lx = Math.abs(x1 - x0), ly = Math.abs(y1 - y0);
+  const ux = [Math.sign(x1 - x0) || 1, 0], uy = [0, Math.sign(y1 - y0) || 1];
+  let [l1, l2, d1, d2] = verticalFirst ? [ly, lx, uy, ux] : [lx, ly, ux, uy];
+  if (l2 < 1e-9) d2 = d1;
+  else if (l1 < 1e-9) d1 = d2;
+  return { x0, y0, l1, d1, d2, len: lx + ly, cx: x0 + d1[0] * l1, cy: y0 + d1[1] * l1 };
+}
+
+// 경로를 따라 온 거리
+function travel(m, now) {
+  const t = Math.max(0, now - m.t0);
+  if (m.dur) return m.len * m.ease(clamp01(t / m.dur));
+  const k = OMEGA * t / 1000, e0 = -m.len;
+  return m.len + (e0 + (m.v0 / OMEGA + e0) * k) * Math.exp(-k);
+}
+
+// 경로를 따라가는 속도 (px/초)
+function speed(m, now) {
+  const t = Math.max(0, now - m.t0);
+  if (m.dur) return t >= m.dur ? 0 : (travel(m, now) - travel(m, now - 4)) / 0.004;
+  const k = OMEGA * t / 1000;
+  return (m.v0 - (m.v0 + OMEGA * -m.len) * k) * Math.exp(-k);
+}
+
+// 크기·색이 바뀌는 정도. 제자리에서 색만 바뀌는 픽셀도 서서히 바뀌게 시간으로 잰다
+function progress(m, now) {
+  const t = Math.max(0, now - m.t0);
+  if (m.dur) return m.ease(clamp01(t / m.dur));
+  const k = OMEGA * t / 1000;
+  return 1 - (1 + k) * Math.exp(-k);
+}
+
+function arrived(m, now) {
+  if (m.dur) return now - m.t0 >= m.dur;
+  return Math.abs(m.len - travel(m, now)) < 0.3 && Math.abs(speed(m, now)) < 6 && progress(m, now) > 0.99;
+}
+
+// 지금 픽셀의 가운데 위치(화면 가운데 기준 px), 크기, 색, 속도
+function pose(p, now) {
+  const goal = colorOf(theme, p.kind), m = p.m;
+  if (!m) return { x: (p.tx + 0.5) * unit, y: (p.ty + 0.5) * unit, s: unit, rgb: goal, v: [0, 0] };
+  const s = travel(m, now), sp = speed(m, now), d = s <= m.l1 ? m.d1 : m.d2;
+  const f = progress(m, now);
+  return {
+    x: s <= m.l1 ? m.x0 + m.d1[0] * s : m.cx + m.d2[0] * (s - m.l1),
+    y: s <= m.l1 ? m.y0 + m.d1[1] * s : m.cy + m.d2[1] * (s - m.l1),
+    s: m.s0 + (m.s1 - m.s0) * f,
+    rgb: m.c0.map((c, k) => c + (goal[k] - c) * f),
+    v: [d[0] * sp, d[1] * sp],
+  };
+}
+
+// 픽셀들이 실제로 움직이는 길이(가로 거리 + 세로 거리)의 합이 가장 작도록 새 칸에 배정한다.
+// 길이가 같은 배정이 여럿이면 직선거리 제곱이 작은 쪽을 고른다. 그래서 글자 전체가 밀릴 때는 그대로 평행이동한다.
+// 칸이 더 많으면 가장 가까운 픽셀에서 새 픽셀이 갈라져 나오고, 적으면 남는 픽셀이 가장 가까운 칸으로 모여 합쳐진다.
+function retarget() {
+  const now = performance.now();
+  const { cells: T, w, h } = targets(text, theme);
+  const u1 = fitUnit(w, h);
+  const old = px, S = old.map(p => pose(p, now)), N = S.length, M = T.length, n = Math.max(N, M);
+  // 비용은 새 배치의 칸 단위로 잰다 (글자 크기가 바뀌어도 화면에서 움직이는 길이 그대로)
+  const src = S.map(q => ({ x: q.x / u1 - 0.5, y: q.y / u1 - 0.5 }));
+  const d = (s, t) => {
+    const dx = Math.abs(s.x - t.x), dy = Math.abs(s.y - t.y);
+    return dx + dy + 1e-6 * (dx * dx + dy * dy);
+  };
+  const move = (p, q) => {
+    const x1 = (p.tx + 0.5) * u1, y1 = (p.ty + 0.5) * u1;
+    // 기본은 가로 먼저. 세로로 가던 픽셀은 세로부터 마저 가서, 연달아 칠 때 계단처럼 자주 꺾이지 않게
+    const path = lPath(q.x, q.y, x1, y1, Math.abs(q.v[1]) > Math.abs(q.v[0]) && Math.abs(y1 - q.y) > 0.5);
+    p.m = { ...path, s0: q.s, s1: u1, c0: q.rgb.slice(), t0: now,
+      ...(live ? { v0: q.v[0] * path.d1[0] + q.v[1] * path.d1[1] } : ENTER) };
+  };
+  const cost = new Float64Array(n * n);
+  if (M >= N) {
+    // 행 = 칸, 열 = 픽셀 + (M - N)개의 "아무 픽셀에서나 갈라져 나옴" 열
+    const near = new Int32Array(M);
+    for (let j = 0; j < M; j++) {
+      let best = Infinity;
+      for (let i = 0; i < N; i++) {
+        const c = cost[j * n + i] = d(src[i], T[j]);
+        if (c < best) { best = c; near[j] = i; }
+      }
+      for (let k = N; k < n; k++) cost[j * n + k] = best;
+    }
+    const col = hungarian(cost, n);
+    px = T.map((t, j) => {
+      const born = col[j] >= N, q = S[born ? near[j] : col[j]];
+      const p = born ? {} : old[col[j]];
+      Object.assign(p, { tx: t.x, ty: t.y, die: false, kind: t.kind });
+      // 갈라져 나온 픽셀은 멈춘 채로 출발한다. 부모 속도를 물려받으면 반대쪽으로 가다가 되돌아오며 꿀렁인다
+      move(p, born ? { ...q, rgb: THEME[theme].ink, v: [0, 0] } : q);
+      return p;
+    });
+  } else {
+    // 행 = 픽셀, 열 = 칸 + (N - M)개의 "가장 가까운 칸으로 합쳐짐" 열
+    const near = new Int32Array(N);
+    for (let i = 0; i < N; i++) {
+      let best = Infinity;
+      for (let j = 0; j < M; j++) {
+        const c = cost[i * n + j] = d(src[i], T[j]);
+        if (c < best) { best = c; near[i] = j; }
+      }
+      for (let k = M; k < n; k++) cost[i * n + k] = best;
+    }
+    const col = hungarian(cost, n), keep = [];
+    old.forEach((p, i) => {
+      const j = col[i] < M ? col[i] : near[i], q = keep[j];
+      // 합쳐져 사라질 픽셀은 글자색으로 가며 사라진다. 포인트 색은 칸에 남는 픽셀만 받아 줄마다 하나씩만 보인다
+      Object.assign(p, { tx: T[j].x, ty: T[j].y, die: true, own: col[i] < M, kind: 'ink' });
+      if (!q || (p.own && !q.own)) keep[j] = p;
+    });
+    keep.forEach((p, j) => { p.die = false; p.kind = T[j].kind; });
+    old.forEach((p, i) => move(p, S[i]));
+  }
+  unit = u1;
+  start();
+}
+
+// ---- 라이트·다크 전환: index.html의 전환을 아무 글자에나 쓸 수 있게 넓힌 것 ----
+// 라이트 → 다크: 줄마다 빨간 점이 막대를 치고, 닿는 순간 그 자리에서 어둠이 네모난 물결로 퍼진다.
+//   바이너리: 물결이 닿는 순간 바탕 칸은 바로 꺼지고 글자 칸은 바로 새 색으로 뒤집힌다. 마지막에 전구 점이 막대를 두 번 쳐서 켜진다.
+// 다크 → 라이트: 전구를 먼저 끄고, 빨간 점이 막대를 치면 빛이 같은 물결로 퍼진다 (닿는 칸이 바로 켜짐)
+const T = { spread: 1200, bgCell: 320 };   // bgCell은 전구가 뛰기 시작하는 박자에만 쓴다 (index.html과 같은 타이밍)
+const RED_HOP = [
+  { at: 0, crouch: 140, up: 280, down: 240, hit: 100, back: 640, lift: 0.5, force: 1, light: [] },
+];
+// 전구 점: 막대를 두 번 친다. 첫 번째는 한 번 번쩍하고 말고, 두 번째에 켜진다
+const LAMP_HOPS = [
+  { at: 0,    crouch: 120, up: 240, down: 250, hit: 90,  back: 440, lift: 0.3,  force: 0.6,
+    light: [[0, 35]] },
+  { at: 1520, crouch: 160, up: 320, down: 260, hit: 110, back: 760, lift: 0.75, force: 1,
+    light: [[0, 70], [130, Infinity]] },
+];
+const contactAt = p => p.at + p.crouch + p.up + p.down;
+const outExpo = x => x >= 1 ? 1 : 1 - Math.pow(2, -10 * x);
+const inExpo = x => x <= 0 ? 0 : Math.pow(2, 10 * x - 10);
+const smooth = (a, b, x) => { const k = clamp01((x - a) / (b - a)); return k * k * (3 - 2 * k); };
+const mix = (a, b, k) => a.map((v, i) => v + (b[i] - v) * k);
+const rgb = a => `rgb(${a.map(Math.round).join(',')})`;
+const key = (x, y) => `${x},${y}`;
+const frac = v => v - Math.floor(v);
+const hash = (x, y) => {   // 칸마다 고정된 흐트러짐
+  let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+};
+
+// 점의 위치. e = 막대 쪽으로 움직인 거리 (칸 단위, 쉴 때 0, 막대에 닿으면 1).
+// 막대가 없는 점(reach 0)은 제자리에서 뛰었다가 내려앉는다
+function hopPose(hops, h, reach) {
+  for (const p of hops) {
+    const t1 = p.at + p.crouch, t2 = t1 + p.up, t3 = t2 + p.down, t4 = t3 + p.hit, t5 = t4 + p.back;
+    if (h < p.at || h >= t5) continue;
+    if (h < t1) return { e: 0, crouch: Math.sin(Math.PI * (h - p.at) / p.crouch) * p.force };
+    if (h < t2) return { e: -p.lift * outExpo((h - t1) / p.up), fly: true };
+    if (h < t3) return { e: -p.lift + (reach + p.lift) * inExpo((h - t2) / p.down), fly: true };
+    if (h < t4) {
+      const c = Math.sin(Math.PI * (h - t3) / p.hit) * p.force;
+      return { e: reach * (1 + 0.24 * c), hit: c };
+    }
+    return { e: reach * (1 - outExpo((h - t4) / p.back)), fly: reach > 0 };
+  }
+  return { e: 0 };
+}
+
+function hopState(hops, h, reach) {
+  const pose = hopPose(hops, h, reach);
+  let sx = 1, sy = 1;
+  if (pose.hit) { sy = 1 - 0.32 * pose.hit; sx = 1 + 0.26 * pose.hit; }
+  else if (pose.crouch) { sy = 1 - 0.14 * pose.crouch; sx = 1 + 0.1 * pose.crouch; }
+  else if (pose.fly) {   // 빠를수록 길게 늘어남
+    const v = Math.abs(hopPose(hops, h + 1, reach).e - hopPose(hops, h - 1, reach).e) / 2;
+    const st = 0.2 * (1 - Math.exp(-v * 25));
+    sy = 1 + st; sx = 1 - st * 0.7;
+  }
+  let stemSy = 1, stemSx = 1, light = 0, halo = 0;
+  for (const p of hops) {
+    const contact = contactAt(p), release = contact + p.hit, k = h - contact;
+    if (k >= 0 && h < release) {
+      const c = Math.sin(Math.PI * k / p.hit) * p.force;
+      stemSy = 1 - 0.12 * c; stemSx = 1 + 0.06 * c;
+    } else if (h >= release && h < release + 420) {   // 막대가 보잉 하고 흔들림
+      const f = (h - release) / 420;
+      stemSy = 1 + 0.05 * p.force * Math.sin(Math.PI * 2.5 * f) * Math.exp(-5 * f);
+    }
+    for (const [a, b] of p.light) if (k >= a && k < b) light = 1;
+    if (p === hops[hops.length - 1] && k >= 0) {   // 켜지는 순간 한 번 퍼졌다 사라지는 빛
+      halo = light * 0.24 * Math.min(1, k / 80) * Math.exp(-k / 900) * (1 - smooth(1600, 2600, k));
+    }
+  }
+  return { e: pose.e, sx, sy, stemSy, stemSx, light, halo };
+}
+
+// 점과 같은 열에서 한 칸 띄고 이어지는 막대 (i의 점 → 아래 기둥, 느낌표 점 → 위 막대). 없으면 막대 없이 제자리에서 뛴다
+function hopper(p, occ) {
+  for (const dir of [1, -1]) {
+    if (occ.has(key(p.tx, p.ty + dir))) continue;
+    const bar = [];
+    for (let y = p.ty + 2 * dir, q; (q = occ.get(key(p.tx, y))) && q.kind === 'ink'; y += dir) bar.push(q);
+    if (bar.length) return { p, dir, bar };
+  }
+  return { p, dir: 1, bar: [] };
+}
+
+function startTheme(next) {
+  const from = theme, occ = new Map();
+  theme = next;
+  const kinds = new Map(targets(text, next).cells.map(a => [key(a.x, a.y), a.kind]));
+  for (const p of px) {
+    // 다크 → 라이트는 전구를 먼저 끈다
+    p.from = p.kind === 'lamp' && from === 'dark' ? LAMP_OFF : colorOf(from, p.kind);
+    p.kind = kinds.get(key(p.tx, p.ty)) || 'ink';
+    p.to = p.kind === 'lamp' ? LAMP_OFF : colorOf(next, p.kind);   // 전구는 꺼진 채 찍혔다가 나중에 켜진다
+    occ.set(key(p.tx, p.ty), p);
+  }
+  const reds = px.filter(p => p.kind === 'red').map(p => hopper(p, occ));
+  const lamps = px.filter(p => p.kind === 'lamp').map(p => hopper(p, occ));
+  const redHop = next === 'dark' ? 0 : 300, sweep = redHop + contactAt(RED_HOP[0]);
+  const hop = sweep + T.spread + T.bgCell + 500;
+  anim = {
+    t0: performance.now(), from, to: next, reds, lamps, redHop, sweep, hop, occ,
+    end: next === 'dark' ? hop + 4150 : sweep + T.spread + 100,
+    ox: frac(px[0].tx), oy: frac(px[0].ty),
+  };
+  start();
+}
+
+// 물결이 닿는 시각. 가장 가까운 빨간 점에서 잰 칸 거리(가까운 칸부터, 처음이 빠름)
+function sweepGrid(A) {
+  const gk = `${unit},${W},${H}`;
+  if (A.gridKey === gk) return A.grid;
+  const c0 = Math.floor(-W / 2 / unit - A.ox) - 1, c1 = Math.ceil(W / 2 / unit - A.ox) + 1;
+  const r0 = Math.floor(-H / 2 / unit - A.oy) - 1, r1 = Math.ceil(H / 2 / unit - A.oy) + 1;
+  const dist = (x, y) => Math.min(...A.reds.map(h => Math.max(Math.abs(x - h.p.tx), Math.abs(y - h.p.ty))));
+  const cells = [];
+  let dmax = 1;
+  for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
+    const x = c + A.ox, y = r + A.oy, d = dist(x, y);
+    dmax = Math.max(dmax, d);
+    if (!A.occ.has(key(x, y))) cells.push({ x, y, c, r, d });
+  }
+  const flipAt = (d, c, r) => {
+    const dj = d === 0 ? 0 : Math.max(0.35, d + (hash(c, r) - .5) * 1.6);
+    return A.sweep + T.spread * Math.pow(Math.min(dj, dmax) / dmax, 1.3);
+  };
+  for (const a of cells) a.flip = flipAt(a.d, a.c, a.r);
+  const pxFlip = new Map(px.map(p => [p, flipAt(dist(p.tx, p.ty), Math.round(p.tx - A.ox), Math.round(p.ty - A.oy))]));
+  // UI는 자기 가운데 칸에 물결이 닿을 때 뒤집힌다
+  const dpr = W / innerWidth;
+  const uiFlip = new Map(uiEls.map(el => {
+    const b = el.getBoundingClientRect();
+    const c = Math.floor(((b.left + b.width / 2) * dpr - W / 2) / unit - A.ox);
+    const r = Math.floor(((b.top + b.height / 2) * dpr - H / 2) / unit - A.oy);
+    return [el, flipAt(dist(c + A.ox, r + A.oy), c, r)];
+  }));
+  A.gridKey = gk;
+  A.grid = { cells, pxFlip, uiFlip };
+  return A.grid;
+}
+
+function renderTheme(now) {
+  const A = anim, t = now - A.t0, P0 = THEME[A.from], P1 = THEME[A.to], toDark = A.to === 'dark';
+  const { cells, pxFlip, uiFlip } = sweepGrid(A);
+  for (const el of uiEls) setUi(el, t >= uiFlip.get(el) ? A.to : A.from);
+  const cx = W / 2, cy = H / 2, u = unit;
+  const cellRect = (x, y) => {
+    const x0 = Math.round(cx + x * u), y0 = Math.round(cy + y * u);
+    return [x0, y0, Math.round(cx + (x + 1) * u) - x0, Math.round(cy + (y + 1) * u) - y0];
+  };
+  const waveDone = t >= A.sweep + T.spread;
+
+  // 바탕: 라이트 → 다크는 아직 안 닿은 칸만 밝게 남고, 다크 → 라이트는 닿은 칸부터 밝아진다
+  ctx.fillStyle = rgb(toDark ? (t >= A.sweep ? P1.bg : P0.bg) : (waveDone ? P1.bg : P0.bg));
+  ctx.fillRect(0, 0, W, H);
+  if (t >= A.sweep && !waveDone) {
+    ctx.fillStyle = rgb(toDark ? P0.bg : P1.bg);
+    for (const a of cells) if ((t < a.flip) === toDark) ctx.fillRect(...cellRect(a.x, a.y));
+  }
+
+  // 글자 칸: 물결이 닿는 순간 새 색으로 뒤집힘
+  const ink = p => t >= pxFlip.get(p) ? p.to : p.from;
+  const lampsOn = toDark && t >= A.hop;
+  const paired = new Set();
+  for (const h of A.reds.concat(lampsOn ? A.lamps : [])) { paired.add(h.p); for (const q of h.bar) paired.add(q); }
+  const lampStates = lampsOn ? A.lamps.map(h => hopState(LAMP_HOPS, t - A.hop, h.bar.length ? 1 : 0)) : [];
+  A.lamps.forEach((h, i) => { if (lampStates[i]?.halo > 0) drawHalo(h, lampStates[i]); });
+  for (const p of px.slice().sort((a, b) => RANK[a.kind] - RANK[b.kind])) {
+    if (paired.has(p)) continue;
+    ctx.fillStyle = rgb(ink(p));
+    ctx.fillRect(...cellRect(p.tx, p.ty));
+  }
+  for (const h of A.reds) {
+    const s = t >= A.redHop ? hopState(RED_HOP, t - A.redHop, h.bar.length ? 1 : 0) : hopState([], 0, 0);
+    drawPair(h, s, t >= A.sweep ? P1.red : P0.red, ink);
+  }
+  A.lamps.forEach((h, i) => { if (lampsOn) drawPair(h, lampStates[i], mix(LAMP_OFF, LAMP_ON, lampStates[i].light), ink); });
+}
+
+// 점이 그려질 네모. dir 1 = 점 아래에 막대(또는 땅), -1 = 점 위에 막대
+function dotRect(h, s) {
+  const u = unit, w = u * s.sx, hh = u * s.sy, x = W / 2 + (h.p.tx + 0.5) * u - w / 2;
+  const y = h.dir > 0 ? H / 2 + (h.p.ty + 1 + s.e) * u - hh : H / 2 + (h.p.ty - s.e) * u;
+  return [x, y, w, hh];
+}
+
+function drawHalo(h, s) {
+  const [x, y, w, hh] = dotRect(h, s), gx = x + w / 2, gy = y + hh / 2, R = unit * 3.2;
+  const g = ctx.createRadialGradient(gx, gy, unit * 0.2, gx, gy, R);
+  g.addColorStop(0, `rgba(251,242,54,${s.halo})`);
+  g.addColorStop(0.4, `rgba(251,242,54,${s.halo * 0.35})`);
+  g.addColorStop(1, 'rgba(251,242,54,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(gx - R, gy - R, R * 2, R * 2);
+}
+
+// 점과 막대 한 쌍. 막대는 먼 쪽 끝을 붙인 채 눌리고, 칸마다 물결이 닿으면 새 색으로 뒤집힌다
+function drawPair(h, s, dotColor, ink) {
+  const u = unit, n = h.bar.length, mid = W / 2 + (h.p.tx + 0.5) * u;
+  if (n) {
+    const sw = u * s.stemSx, sh = n * u * s.stemSy;
+    const top = h.dir > 0 ? H / 2 + (h.p.ty + 2 + n) * u - sh : H / 2 + (h.p.ty - 1 - n) * u;
+    h.bar.forEach((q, i) => {
+      const j = h.dir > 0 ? i : n - 1 - i;   // j = 위에서부터 몇 번째 칸
+      const x0 = Math.round(mid - sw / 2), y0 = Math.round(top + j * sh / n);
+      ctx.fillStyle = rgb(ink(q));
+      ctx.fillRect(x0, y0, Math.round(mid + sw / 2) - x0, Math.round(top + (j + 1) * sh / n) - y0);
+    });
+  }
+  const [x, y, w, hh] = dotRect(h, s);
+  ctx.fillStyle = rgb(dotColor);
+  ctx.fillRect(Math.round(x), Math.round(y), Math.round(x + w) - Math.round(x), Math.round(y + hh) - Math.round(y));
+}
+
+function frame(now) {
+  for (const p of px) if (p.m && arrived(p.m, now)) p.m = null;
+  px = px.filter(p => !(p.die && !p.m));   // 합쳐진 픽셀은 도착하면 지운다
+  // 테마 전환은 픽셀이 다 멈춘 뒤에 시작한다
+  if (pendingTheme && !anim && !px.some(p => p.m)) { const th = pendingTheme; pendingTheme = null; startTheme(th); }
+  if (anim && now - anim.t0 >= anim.end) {
+    anim = null;
+    document.documentElement.style.background = rgb(THEME[theme].bg);
+    for (const el of uiEls) setUi(el, theme);
+    if (pendingText) { pendingText = false; retarget(); }
+  }
+  draw(now);
+  running = !!anim || !!pendingTheme || px.some(p => p.m);
+  if (running) requestAnimationFrame(frame);
+}
+
+function start() {
+  if (!running) { running = true; requestAnimationFrame(frame); }
+}
+
+function draw(now) {
+  if (anim) renderTheme(now); else render(now);
+}
+
+function render(now) {
+  ctx.fillStyle = rgb(THEME[theme].bg);
+  ctx.fillRect(0, 0, W, H);
+  const cx = W / 2, cy = H / 2;
+  // 사라질 픽셀을 먼저, 색 있는 픽셀을 맨 위에
+  const order = px.slice().sort((a, b) => (b.die ? 1 : 0) - (a.die ? 1 : 0) || RANK[a.kind] - RANK[b.kind]);
+  for (const p of order) {
+    const q = pose(p, now);
+    const x0 = Math.round(cx + q.x - q.s / 2), y0 = Math.round(cy + q.y - q.s / 2);
+    ctx.fillStyle = rgb(q.rgb);
+    ctx.fillRect(x0, y0, Math.round(cx + q.x + q.s / 2) - x0, Math.round(cy + q.y + q.s / 2) - y0);
+  }
+}
+
+function layout() {
+  const dpr = window.devicePixelRatio || 1;
+  W = canvas.width = Math.round(innerWidth * dpr);
+  H = canvas.height = Math.round(innerHeight * dpr);
+  const { w, h } = targets(text, theme);
+  unit = fitUnit(w, h);
+  // 창 크기가 바뀌면 움직이던 픽셀도 제자리로 보낸다
+  px = px.filter(p => !p.die);
+  for (const p of px) p.m = null;
+  draw(performance.now());
+}
+
+function show(str) {
+  if (str === text) return;
+  text = str;
+  if (anim) pendingText = true; else retarget();
+}
+
+function setLive(on) {
+  live = on;
+  liveBtn.classList.toggle('on', live);
+  liveBtn.setAttribute('aria-pressed', live);
+  input.enterKeyHint = live ? 'enter' : 'go';   // 모바일 키보드의 엔터 키: live는 줄바꿈, 아니면 바꾸기
+  // 켜는 순간 입력창의 글자로 바뀐다. 입력창이 비어 있으면 지금 보이는 글자를 넣어 이어서 고칠 수 있게
+  if (live && input.value) show(clean(input.value));
+  else if (live) input.value = text;
+  fit();
+  idle();
+}
+
+// 입력창 높이를 줄 수에 맞춘다
+function fit() {
+  input.style.height = 'auto';
+  input.style.height = `${input.scrollHeight}px`;
+}
+
+// 두벌식 자판 자리 → 영문. 한글 입력 상태로 쳐도 같은 자리의 영문으로 받는다
+const KO = {
+  ㅘ: 'hk', ㅙ: 'ho', ㅚ: 'hl', ㅝ: 'nj', ㅞ: 'np', ㅟ: 'nl', ㅢ: 'ml',
+  ㄳ: 'rt', ㄵ: 'sw', ㄶ: 'sg', ㄺ: 'fr', ㄻ: 'fa', ㄼ: 'fq', ㄽ: 'ft', ㄾ: 'fx', ㄿ: 'fv', ㅀ: 'fg', ㅄ: 'qt',
+};
+[...'ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎㅏㅐㅑㅒㅓㅔㅕㅖㅗㅛㅜㅠㅡㅣ']
+  .forEach((j, i) => { KO[j] = 'rrseefaqqttdwwczxvgkoiojpuphynbml'[i]; });
+const CHO = 'ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ', JUNG = 'ㅏㅐㅑㅒㅓㅔㅕㅖㅗㅘㅙㅚㅛㅜㅝㅞㅟㅠㅡㅢㅣ';
+const JONG = ['', ...'ㄱㄲㄳㄴㄵㄶㄷㄹㄺㄻㄼㄽㄾㄿㅀㅁㅂㅄㅅㅆㅇㅈㅊㅋㅌㅍㅎ'];
+
+// 입력창 글자 → 그릴 수 있는 글자와 줄바꿈만. 한글은 자판 자리대로 풀고, 대문자는 소문자로
+function clean(s) {
+  let out = '';
+  for (const ch of s) {
+    const k = ch.charCodeAt(0) - 0xAC00;
+    if (k >= 0 && k < 11172) out += KO[CHO[Math.floor(k / 588)]] + KO[JUNG[Math.floor(k % 588 / 28)]] + (k % 28 ? KO[JONG[k % 28]] : '');
+    else out += KO[ch] ?? ch;
+  }
+  return [...out.toLowerCase()].filter(ch => GLYPHS[ch] || ch === '\n').join('').slice(0, MAX_LEN);
+}
+
+// 한글 조합 중에는 입력창을 고쳐 쓰지 않는다 (조합이 깨진다). 조합이 끝나면 영문으로 바꿔 둔다
+let composing = false, enterAfterCompose = false;
+// 입력창이 비어 있고 커서가 없을 때(모바일에서 아직 안 눌렀을 때 등) 가짜 빨간 커서를 깜빡인다
+function idle() {
+  bar.classList.toggle('idle', !input.value && !(document.activeElement === input && document.hasFocus()));
+}
+function sync() {
+  const v = clean(input.value);
+  if (!composing && v !== input.value) {
+    const at = clean(input.value.slice(0, input.selectionStart)).length;   // 커서는 고친 뒤에도 같은 글자 뒤에
+    input.value = v;
+    input.setSelectionRange(at, at);
+  }
+  fit();
+  idle();
+  if (live) show(v);
+}
+function commit() {
+  if (live) return;
+  show(clean(input.value));
+  input.value = '';
+  fit();
+  idle();
+}
+input.addEventListener('compositionstart', () => { composing = true; });
+input.addEventListener('compositionend', () => {
+  composing = false;
+  sync();
+  if (enterAfterCompose) { enterAfterCompose = false; commit(); }
+});
+input.addEventListener('input', sync);
+for (const [el, ev] of [[input, 'focus'], [input, 'blur'], [window, 'focus'], [window, 'blur']]) el.addEventListener(ev, idle);
+// 엔터: live에서는 다음 줄. 아니면 바꾸기이고 Shift+Enter가 다음 줄
+input.addEventListener('keydown', e => {
+  if (e.key !== 'Enter' || live || e.shiftKey) return;
+  e.preventDefault();
+  if (e.isComposing) enterAfterCompose = true; else commit();   // 조합 중 엔터는 조합을 끝낸 뒤 반영
+});
+
+// 어디서 치든 입력창으로. Esc는 지우고 로고로
+addEventListener('keydown', e => {
+  if (e.key === 'Escape') { input.value = ''; fit(); idle(); show(''); return; }
+  if (e.target !== input && e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) input.focus();
+});
+// 마우스로 다른 곳을 눌러도 입력창의 커서를 잃지 않게.
+// 터치에서는 빈 곳을 누르면 키보드가 내려가게 두고, 입력창과 live 박스를 누를 때만 붙잡는다
+let pointer = 'mouse';
+addEventListener('pointerdown', e => { pointer = e.pointerType; }, true);
+addEventListener('mousedown', e => {
+  if (e.target !== input && (pointer === 'mouse' || dock.contains(e.target))) e.preventDefault();
+});
+
+liveBtn.addEventListener('click', () => setLive(!live));
+// 테마: 전환 중에는 무시. 픽셀이 움직이는 중이면 멈춘 뒤에 시작
+themeBtn.addEventListener('click', () => {
+  if (anim) return;
+  const next = (pendingTheme || theme) === 'dark' ? 'light' : 'dark';
+  pendingTheme = next === theme ? null : next;
+  start();
+});
+
+// iOS는 키보드가 화면을 줄이지 않고 덮는다. 보이는 영역 바닥에 입력창을 붙인다
+if (window.visualViewport) {
+  const vv = window.visualViewport;
+  const lift = () => {
+    dock.style.transform = `translateX(-50%) translateY(${-Math.max(0, innerHeight - vv.height - vv.offsetTop)}px)`;
+  };
+  vv.addEventListener('resize', lift);
+  vv.addEventListener('scroll', lift);
+}
+addEventListener('resize', layout);
+
+layout();
+if (matchMedia('(pointer: fine)').matches) input.focus();   // 데스크톱은 바로 칠 수 있게. 모바일은 눌러야 키보드가 뜬다
+idle();
+</script>
+</body>
+</html>
