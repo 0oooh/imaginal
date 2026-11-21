@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <!-- maximum-scale: iOS가 입력창을 누를 때 화면을 확대하지 않게 (손가락 확대는 그대로 됨) -->
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, interactive-widget=resizes-content">
+<meta name="theme-color" content="#000000">
 <title>imaginal</title>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
@@ -23,7 +24,7 @@
     transition: background-color .15s, color .15s;
   }
   @media (hover: hover) { #theme:hover { background: rgb(var(--ink)); color: rgb(var(--bg)); } }
-  /* 하단: 입력창과 그 옆에 떨어진 live 박스 */
+  /* 하단: 입력창과 그 옆에 떨어진 sync 박스 */
   #dock {
     position: absolute; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom)); transform: translateX(-50%);
     display: flex; align-items: flex-end; gap: 8px;
@@ -69,7 +70,7 @@
       autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="text"></textarea>
     <span id="caret"></span>
   </div>
-  <button id="live" class="ui on" type="button" data-theme="dark" aria-pressed="true"><i></i>live</button>
+  <button id="live" class="ui on" type="button" data-theme="dark" aria-pressed="true"><i></i>sync</button>
 </div>
 </div>
 <script>
@@ -639,7 +640,9 @@ function frame(now) {
   if (pendingTheme && !anim && !px.some(p => p.m)) { const th = pendingTheme; pendingTheme = null; startTheme(th); }
   if (anim && now - anim.t0 >= anim.end) {
     anim = null;
-    document.documentElement.style.background = rgb(THEME[theme].bg);
+    // 캔버스 밖(상태 표시줄 뒤, 키보드 위 여백 등)과 Safari 막대 색도 새 테마로
+    document.documentElement.style.background = document.body.style.background = rgb(THEME[theme].bg);
+    document.querySelector('meta[name=theme-color]').content = rgb(THEME[theme].bg);
     for (const el of uiEls) setUi(el, theme);
     if (pendingText) { pendingText = false; retarget(); }
   }
@@ -772,7 +775,7 @@ addEventListener('keydown', e => {
   if (e.target !== input && e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) input.focus();
 });
 // 마우스로 다른 곳을 눌러도 입력창의 커서를 잃지 않게.
-// 터치에서는 빈 곳을 누르면 키보드가 내려가게 두고, 입력창과 live 박스를 누를 때만 붙잡는다
+// 터치에서는 빈 곳을 누르면 키보드가 내려가게 두고, 입력창과 sync 박스를 누를 때만 붙잡는다
 let pointer = 'mouse';
 addEventListener('pointerdown', e => { pointer = e.pointerType; }, true);
 addEventListener('mousedown', e => {
