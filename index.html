@@ -224,7 +224,7 @@ function targets(str, th) {
     let x = -maxW / 2 + Math.round((maxW - widths[k]) / 2);
     const dy = (k - (lines.length - 1) / 2) * LINE - 2.5, cells = [];
     [...line].forEach((ch, g) => {
-      for (const { c, r, dot } of GLYPHS[ch].cells) cells.push({ x: x + c, y: r + dy, r, dot, g });
+      for (const { c, r, dot } of GLYPHS[ch].cells) cells.push({ x: x + c, y: r + dy, r, c, k, dot, g });
       x += GLYPHS[ch].w + GAP;
     });
     pointKinds(cells, th, line);
@@ -633,13 +633,136 @@ function drawPair(h, s, dotColor, ink) {
   ctx.fillRect(Math.round(x), Math.round(y), Math.round(x + w) - Math.round(x), Math.round(y + hh) - Math.round(y));
 }
 
+// ---- 이스터 에그: 아래 네 줄을 치면 크리스마스트리가 된다 ----
+// 글자는 초록이 되고, i의 점(노랑)과 l의 점(빨강)에 더해 글자 몇 군데가 전구가 되어 캐럴 박자에 맞춰 깜빡인다.
+// 맨 아랫줄 g의 꼬리는 나무 기둥이라 짙은 갈색. 다른 글자로 바뀌는 순간 원래대로 돌아가고 소리도 멎는다
+const XMAS_TEXT = 'il\nigl\nimgnl\nimaginal';
+const LEAF = [55, 148, 110], TRUNK = [102, 57, 49];
+const BULB = { lamp: LAMP_ON, red: THEME.light.red };   // 켜진 전구 색. 꺼지면 바탕색 쪽으로 어두워진다
+// 더 다는 전구: [줄, 글자 순서, 글자 안의 칸 c, r, 색]
+const XMAS_BULBS = [
+  [1, 1, 1, 1, 'red'], [1, 1, 0, 5, 'lamp'],
+  [2, 1, 1, 2, 'red'], [2, 2, 2, 4, 'lamp'], [2, 3, 2, 3, 'lamp'],
+  [3, 1, 1, 2, 'red'], [3, 2, 1, 3, 'lamp'], [3, 3, 0, 5, 'red'], [3, 5, 1, 1, 'red'], [3, 6, 0, 2, 'lamp'],
+];
+// 캐럴: 징글벨 후렴 16마디 (1857년 곡, 퍼블릭 도메인). 마디마다 '음:박'들 (한 박 = 4분음표). 다른 곡으로 바꾸려면 이 표만 바꾸면 된다
+const BPM = 150;
+const CAROL = [
+  'E5:1 E5:1 E5:2', 'E5:1 E5:1 E5:2', 'E5:1 G5:1 C5:1.5 D5:.5', 'E5:4',
+  'F5:1 F5:1 F5:1.5 F5:.5', 'F5:1 E5:1 E5:1 E5:.5 E5:.5', 'E5:1 D5:1 D5:1 E5:1', 'D5:2 G5:2',
+  'E5:1 E5:1 E5:2', 'E5:1 E5:1 E5:2', 'E5:1 G5:1 C5:1.5 D5:.5', 'E5:4',
+  'F5:1 F5:1 F5:1.5 F5:.5', 'F5:1 E5:1 E5:1 E5:.5 E5:.5', 'G5:1 G5:1 F5:1 D5:1', 'C5:4',
+];
+const CAROL_BASS = 'C3 C3 C3 C3 F3 C3 D3 G3 C3 C3 C3 C3 F3 C3 G3 C3'.split(' ');   // 마디의 근음
+const SEMI = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+const hz = n => 440 * 2 ** ((SEMI[n[0]] + 12 * (n[1] - 4) - 9) / 12);
+
+let xm = null, audio = null;
+
+// 한 바퀴(16마디)를 t0부터 예약한다. 귀에 거슬리지 않게 멜로디 사각파는 저역 통과 필터로 깎고(out.lead),
+// 베이스는 삼각파, 음마다 부드럽게 열고 닫는다
+function scheduleCarol(ac, out, t0) {
+  const beat = 60 / BPM;
+  const tone = (type, freq, at, dur, vol, dest) => {
+    const o = ac.createOscillator(), g = ac.createGain(), end = at + dur * 0.92;
+    o.type = type;
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(0, at);
+    g.gain.linearRampToValueAtTime(vol, at + 0.008);
+    g.gain.linearRampToValueAtTime(vol * 0.6, at + Math.min(0.12, dur * 0.5));
+    g.gain.setValueAtTime(vol * 0.6, end - 0.04);
+    g.gain.linearRampToValueAtTime(0, end);
+    o.connect(g).connect(dest);
+    o.start(at);
+    o.stop(end + 0.01);
+  };
+  CAROL.forEach((bar, i) => {
+    let at = t0 + i * 4 * beat;
+    for (const note of bar.split(' ')) {
+      const [n, len] = note.split(':');
+      tone('square', hz(n), at, len * beat, 0.11, out.lead);
+      at += len * beat;
+    }
+    const root = hz(CAROL_BASS[i]);   // 1박에 근음, 3박에 5도 위
+    tone('triangle', root, t0 + i * 4 * beat, 2 * beat, 0.16, out.bass);
+    tone('triangle', root * 1.5, t0 + (i * 4 + 2) * beat, 2 * beat, 0.13, out.bass);
+  });
+}
+
+// 소리는 키 입력(사용자 동작) 안에서 만들어 둬야 브라우저가 틀어 준다
+function primeAudio() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC || audio) return;
+  const ac = new AC(), lead = ac.createBiquadFilter();
+  lead.type = 'lowpass';
+  lead.frequency.value = 1500;
+  lead.connect(ac.destination);
+  audio = { ac, out: { lead, bass: ac.destination }, t0: null, timer: 0 };
+  ac.resume();
+}
+
+function playCarol() {
+  if (!audio) return;
+  const { ac, out } = audio, loop = CAROL.length * 4 * 60 / BPM;
+  let next = audio.t0 = ac.currentTime + 0.06;
+  const fill = () => { while (next < ac.currentTime + 3) { scheduleCarol(ac, out, next); next += loop; } };
+  fill();
+  audio.timer = setInterval(fill, 1000);   // 끝나기 전에 다음 바퀴를 이어 붙인다
+}
+
+function startXmas(now) {
+  const lines = XMAS_TEXT.split('\n'), parts = new Map();
+  for (const a of targets(text, theme).cells) {
+    const ch = lines[a.k][a.g];
+    const more = XMAS_BULBS.find(([k, g, c, r]) => k === a.k && g === a.g && c === a.c && r === a.r);
+    const part = a.dot && ch === 'i' ? 'lamp' : a.dot && ch === 'l' ? 'red' : more ? more[4]
+      : a.k === lines.length - 1 && ch === 'g' && a.r >= 4 ? 'trunk' : null;   // 기준선 아래로 내려온 꼬리
+    if (part) parts.set(key(a.x, a.y), part);
+  }
+  for (const p of px) p.part = parts.get(key(p.tx, p.ty)) || null;   // lamp·red = 전구, trunk = 기둥, 없으면 잎
+  xm = { t0: now, top: Math.min(...px.map(p => p.ty)) };
+  playCarol();
+}
+
+function stopXmas() {
+  xm = null;
+  for (const p of px) p.part = null;
+  if (!audio) return;
+  clearInterval(audio.timer);
+  audio.ac.close();
+  audio = null;
+}
+
+// 지금 몇 번째 박인지. 소리가 나고 있으면 소리의 시계를 따라 박자에 딱 맞춘다
+function xmasBeat(now) {
+  const playing = audio && audio.t0 !== null && audio.ac.state === 'running';
+  return Math.max(0, playing ? audio.ac.currentTime - audio.t0 : (now - xm.t0) / 1000) * BPM / 60;
+}
+
+// 4마디(16박)가 한 묶음: 세 마디는 한 박씩 노랑, 빨강이 번갈아 켜지고, 마지막 마디는 둘이 같이 반 박씩 깜빡인다
+function bulbOn(kind, beat) {
+  const b = beat % 16;
+  return b < 12 ? (Math.floor(b) % 2 === 0) === (kind === 'lamp') : Math.floor(b * 2) % 2 === 0;
+}
+
+// 트리가 된 픽셀의 색. 꼭대기부터 한 줄씩 바로 바뀐다 (아직 차례가 안 온 픽셀은 null)
+function xmasColor(p, now, beat) {
+  if (now < xm.t0 + (p.ty - xm.top) * 30 + hash(Math.round(p.tx * 2), Math.round(p.ty * 2)) * 40) return null;
+  if (!p.part) return LEAF;
+  if (p.part === 'trunk') return TRUNK;
+  return bulbOn(p.part, beat) ? BULB[p.part] : mix(THEME[theme].bg, BULB[p.part], 0.3);
+}
+
 function frame(now) {
   for (const p of px) if (p.m && arrived(p.m, now)) p.m = null;
   px = px.filter(p => !(p.die && !p.m));   // 합쳐진 픽셀은 도착하면 지운다
   // 테마 전환은 픽셀이 다 멈춘 뒤에 시작한다
   if (pendingTheme && !anim && !px.some(p => p.m)) { const th = pendingTheme; pendingTheme = null; startTheme(th); }
+  // 트리도 픽셀이 다 멈춘 뒤에 켜진다
+  if (text === XMAS_TEXT && !xm && !anim && !pendingTheme && !px.some(p => p.m)) startXmas(now);
   if (anim && now - anim.t0 >= anim.end) {
     anim = null;
+    if (xm) xm.t0 = now;   // 테마가 바뀌는 동안은 보통 색으로 보이다가, 끝나면 트리가 꼭대기부터 다시 켜진다
     // 캔버스 밖(상태 표시줄 뒤, 키보드 위 여백 등)과 Safari 막대 색도 새 테마로
     document.documentElement.style.background = document.body.style.background = rgb(THEME[theme].bg);
     document.querySelector('meta[name=theme-color]').content = rgb(THEME[theme].bg);
@@ -647,7 +770,7 @@ function frame(now) {
     if (pendingText) { pendingText = false; retarget(); }
   }
   draw(now);
-  running = !!anim || !!pendingTheme || px.some(p => p.m);
+  running = !!anim || !!pendingTheme || !!xm || px.some(p => p.m);
   if (running) requestAnimationFrame(frame);
 }
 
@@ -665,10 +788,11 @@ function render(now) {
   const cx = W / 2, cy = H / 2;
   // 사라질 픽셀을 먼저, 색 있는 픽셀을 맨 위에
   const order = px.slice().sort((a, b) => (b.die ? 1 : 0) - (a.die ? 1 : 0) || RANK[a.kind] - RANK[b.kind]);
+  const beat = xm && xmasBeat(now);
   for (const p of order) {
     const q = pose(p, now);
     const x0 = Math.round(cx + q.x - q.s / 2), y0 = Math.round(cy + q.y - q.s / 2);
-    ctx.fillStyle = rgb(q.rgb);
+    ctx.fillStyle = rgb(xm && xmasColor(p, now, beat) || q.rgb);
     ctx.fillRect(x0, y0, Math.round(cx + q.x + q.s / 2) - x0, Math.round(cy + q.y + q.s / 2) - y0);
   }
 }
@@ -688,6 +812,8 @@ function layout() {
 function show(str) {
   if (str === text) return;
   text = str;
+  stopXmas();
+  if (text === XMAS_TEXT) primeAudio();
   if (anim) pendingText = true; else retarget();
 }
 
