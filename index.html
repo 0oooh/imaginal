@@ -7,7 +7,7 @@
 <meta name="theme-color" content="#000000">
 <title>imaginal</title>
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  html, body { margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none; background: #000; }
   /* 화면 전체를 지금 보이는 영역에 붙인다. 모바일 키보드가 올라오면 이 상자가 키보드 위 영역으로 줄어든다 */
   #app { position: fixed; left: 0; top: 0; width: 100%; height: 100%; overflow: hidden; }
   canvas { display: block; width: 100%; height: 100%; }
@@ -35,10 +35,10 @@
     border: 1px solid rgba(var(--ink), .22); transition: border-color .2s;
   }
   #bar:focus-within { border-color: rgba(var(--ink), .5); }
-  /* 평소엔 한 줄. 줄이 늘면 위로 커지고 6줄부터는 안에서 스크롤 */
+  /* 크기는 한 줄로 고정. 줄을 바꾸면 상자 안에서 커서가 있는 줄로 넘어간다 */
   #type {
-    width: 100%; display: block; box-sizing: border-box; height: 38px; max-height: 118px;
-    padding: 11px 12px; border: 0; border-radius: 0; outline: 0; resize: none; overflow-y: auto;
+    width: 100%; display: block; box-sizing: border-box; height: 38px;
+    padding: 11px 12px; border: 0; border-radius: 0; outline: 0; resize: none; overflow: hidden;
     background: none; color: inherit; font: inherit; font-size: 13px; line-height: 16px; letter-spacing: .04em;
     caret-color: rgb(var(--red));
   }
@@ -699,14 +699,7 @@ function setLive(on) {
   // 켜는 순간 입력창의 글자로 바뀐다. 입력창이 비어 있으면 지금 보이는 글자를 넣어 이어서 고칠 수 있게
   if (live && input.value) show(clean(input.value));
   else if (live) input.value = text;
-  fit();
   idle();
-}
-
-// 입력창 높이를 줄 수에 맞춘다
-function fit() {
-  input.style.height = 'auto';
-  input.style.height = `${input.scrollHeight}px`;
 }
 
 // 두벌식 자판 자리 → 영문. 한글 입력 상태로 쳐도 같은 자리의 영문으로 받는다
@@ -743,7 +736,6 @@ function sync() {
     input.value = v;
     input.setSelectionRange(at, at);
   }
-  fit();
   idle();
   if (live) show(v);
 }
@@ -751,7 +743,6 @@ function commit() {
   if (live) return;
   show(clean(input.value));
   input.value = '';
-  fit();
   idle();
 }
 input.addEventListener('compositionstart', () => { composing = true; });
@@ -771,7 +762,7 @@ input.addEventListener('keydown', e => {
 
 // 어디서 치든 입력창으로. Esc는 지우고 로고로
 addEventListener('keydown', e => {
-  if (e.key === 'Escape') { input.value = ''; fit(); idle(); show(''); return; }
+  if (e.key === 'Escape') { input.value = ''; idle(); show(''); return; }
   if (e.target !== input && e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) input.focus();
 });
 // 마우스로 다른 곳을 눌러도 입력창의 커서를 잃지 않게.
@@ -792,21 +783,29 @@ themeBtn.addEventListener('click', () => {
 });
 
 // iOS는 키보드가 화면을 줄이지 않고 덮은 뒤, 입력창이 보이게 페이지를 밀어 올린다.
-// 그래서 화면 전체(#app)를 그때그때 보이는 영역(visualViewport)에 맞춰 놓는다: 로고는 키보드 위 가운데, 입력창은 키보드 바로 위.
+// 입력하는 동안에만 화면 전체(#app)를 보이는 영역(visualViewport)에 맞춘다: 로고는 키보드 위 가운데, 입력창은 키보드 바로 위.
+// 입력이 끝나면 전체 화면으로 되돌린다 (iOS 26은 키보드를 닫아도 밀린 값이 남거나, 주소창 자리를 키보드로 잘못 알리는 일이 있다).
 // 손가락으로 확대한 동안은 따라가지 않는다
 const app = document.getElementById('app');
 function fitViewport() {
-  const vv = window.visualViewport, follow = vv && vv.scale < 1.01;
+  const vv = window.visualViewport;
+  const follow = vv && vv.scale < 1.01 && document.activeElement === input
+    && vv.height < document.documentElement.clientHeight - 80;
   app.style.height = follow ? `${vv.height}px` : '';
   app.style.transform = follow ? `translate(${vv.offsetLeft}px, ${vv.offsetTop}px)` : '';
-  // 키보드가 올라와 있으면 홈 표시줄 여백 없이 키보드 바로 위에 붙인다
-  app.classList.toggle('kb', !!follow && vv.height < document.documentElement.clientHeight - 80);
+  app.classList.toggle('kb', !!follow);   // 키보드 위에서는 홈 표시줄 여백 없이 바로 붙인다
+  if (!follow && (scrollX || scrollY)) scrollTo(0, 0);
   const dpr = window.devicePixelRatio || 1;
   if (Math.round(canvas.clientWidth * dpr) !== W || Math.round(canvas.clientHeight * dpr) !== H) layout();
 }
 window.visualViewport?.addEventListener('resize', fitViewport);
 window.visualViewport?.addEventListener('scroll', fitViewport);
 addEventListener('resize', fitViewport);
+input.addEventListener('focus', fitViewport);
+// 키보드가 내려가는 동안 값이 늦게 바뀌어서, 조금 뒤에 한 번 더 맞춘다
+input.addEventListener('blur', () => { fitViewport(); setTimeout(fitViewport, 350); });
+// 페이지는 스크롤되지 않는다. 스크롤하면 주소창이 접혔다 펴지며 보이는 영역이 계속 바뀌어서 막는다 (입력창 안은 그대로)
+document.addEventListener('touchmove', e => { if (e.target !== input) e.preventDefault(); }, { passive: false });
 
 fitViewport();
 layout();
